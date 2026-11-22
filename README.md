@@ -48,6 +48,8 @@ If `checkpoints/` already holds the saved models, training is skipped and they a
 - `scripts/`: helper code used by the notebook
 - `requirements.txt`: package versions
 - `ai_use_declaration.txt`: AI use declaration
-- `report.tex`, `report.pdf`: the report
+- `Md_Aman_Khan_25011138_ENG2440_A3.pdf`: the submitted report
+- `report_source.tex`: the LaTeX source of the report, kept for reference
+  (its figures live in `report_assets/`, which is not uploaded)
 
 The downloaded dataset (`data/`) and `checkpoints/` are not uploaded.

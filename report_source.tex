@@ -1,0 +1,303 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[margin=0.65in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{caption}
+
+\graphicspath{{report_assets/25011138_ENG2440_A3_files/}}
+\newcommand{\placeholder}[1]{\textcolor{red}{[PLACEHOLDER: #1]}}
+\captionsetup[table]{skip=6pt}
+\captionsetup[figure]{skip=4pt}
+\setlength{\parindent}{0pt}
+\emergencystretch=2em
+\setlength{\parskip}{2pt}
+\setlength{\textfloatsep}{6pt plus 2pt minus 2pt}
+\setlength{\floatsep}{5pt plus 2pt minus 2pt}
+\setlength{\intextsep}{5pt plus 2pt minus 2pt}
+\setlist{nosep,leftmargin=*}
+
+\title{ENG 2440 Assignment 3: Molecular Property Prediction with Graph Neural Networks}
+\author{Md Aman Khan\\Student ID: 25011138\\\url{https://github.com/aman2712/Medical_Imaging_Assignment_3}}
+\date{Fall 2026}
+
+\begin{document}
+\maketitle
+\vspace*{-0.2in}
+
+\begin{abstract}
+This assignment built a PyTorch Geometric pipeline to predict blood--brain barrier penetration from molecular structure, using the BBBP dataset from MoleculeNet. The raw file holds 2050 rows, the loader returns 2039 after discarding 11 SMILES that RDKit cannot parse, and the required cleaning rule leaves 1965 unique molecules of which 76.3\% are positive. Two 70:15:15 evaluations were built on those molecules with seed 42, one stratified random and one Bemis--Murcko scaffold split, and a Morgan-fingerprint logistic-regression baseline was compared against a 67{,}268-parameter GINEConv network repeated over seeds 42, 43 and 44. On the untouched test sets the two models are indistinguishable: ROC-AUC 0.8888 against $0.8884 \pm 0.0172$ under the random split and 0.8915 against $0.8877 \pm 0.0212$ under the scaffold split, with the baseline inside one standard deviation of the GNN both times. Changing the split moved the balance of errors more than the ranking quality, raising GNN specificity from 0.6476 to 0.8143 while sensitivity fell from 0.9319 to 0.8065. The four most confident GNN errors on the scaffold test set sit only 0.13 to 0.27 Tanimoto from their nearest training molecule, so similarity does not account for them. The labels are curated literature annotations, so none of this is evidence of clinical usefulness.
+\end{abstract}
+
+\section{Task and Target}
+\textbf{Input}: one molecule, stored as a SMILES string and converted into a graph where atoms are the nodes and bonds are the edges (shapes in Section~3). The feature columns hold category codes, not measured amounts, so they must be one-hot encoded or embedded first. There is no 3D conformer, only the 2D connectivity with atom and bond types.
+
+\textbf{Output}: one probability per molecule that the compound penetrates the blood--brain barrier. Message passing updates the atom vectors, pooling reduces them to one vector for the whole molecule, and a binary head turns that into the probability, so the prediction belongs to the molecule and not to any atom. A threshold chosen on validation turns it into a 0 or 1 decision.
+
+\textbf{Unit of analysis}: the molecule. Splitting, training and evaluation are all per molecule, and no atom-level label exists. Two records with the same canonical SMILES are the same unit even when the original strings are written differently, which is why duplicates are dropped before either split is built.
+
+\textbf{Intended technical use}: a coursework experiment comparing a Morgan-fingerprint baseline with a graph neural network on the same data, and measuring how much the estimate moves when the split changes from random to scaffold-based. At most it could prioritise compounds for a later experiment. It is not a clinical tool and has had no external validation.
+
+\textbf{Labels}: the positive class (1) means the compound is recorded as penetrating the blood--brain barrier and the negative class (0) that it is recorded as not penetrating. Both are curated research labels, collected by Martins et al.~\cite{martins2012} from published permeability studies run under different assays, so they describe the compound rather than a patient and are not all equally reliable.
+
+\section{Dataset Inspection and Cleaning}
+The raw \texttt{BBBP.csv} has 2050 rows and the PyTorch Geometric loader returns 2039. The 11 missing ones are SMILES that RDKit cannot parse and the loader skips, so that count is taken from the raw file; the loaded dataset itself has no invalid SMILES, no empty graphs and no missing or non-finite labels. Of the 2039 loaded molecules, 1560 are positive and 479 negative, so 76.5\% positive (Table~\ref{tab:classes}).
+
+Canonicalization with RDKit leaves 1975 unique molecules. 124 records fall into 60 canonical structures that occur more than once; 50 of those groups agree on the label and 10 disagree. Aspirin is one of the 10, labelled 0 as \texttt{CC(=O)Oc1ccccc1C(O)=O} and 1 as \texttt{C1=CC=CC(=C1C(O)=O)OC(C)=O}.
+
+Applying the required cleaning rule removes 74 of the 2039 records and leaves \textbf{1965 molecules}. Nothing is dropped for an invalid SMILES or an empty graph, because the loader already discarded the 11 unparsable rows. 20 records go as the 10 label-conflicting structures, and a further 54 are extra copies of the 50 consistent structures, keeping one record of each. Both splits are built from these 1965 molecules. Atom count per molecule has median 23 and range 2--132; bond count has median 25 and range 1--145.
+
+\begin{table}[H]
+\centering
+\caption{Class counts and proportions in the loaded dataset (2039 molecules, before cleaning).}
+\label{tab:classes}
+\small
+\begin{tabular}{lrr}
+\toprule
+Class & Count & Proportion\\
+\midrule
+0 (non-penetrating) & 479 & 0.2349\\
+1 (penetrating) & 1560 & 0.7651\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.52\linewidth]{25011138_ENG2440_A3_16_0.png}
+\caption{Six molecules from the dataset, three from each class, with SMILES string and label.}
+\label{fig:molecules}
+\end{figure}
+
+\section{Graph Representation and Batching}
+Each atom is one row of \texttt{x} with nine columns: \texttt{atomic\_num}, \texttt{chirality}, \texttt{degree}, \texttt{formal\_charge}, \texttt{num\_hs}, \texttt{num\_radical\_electrons}, \texttt{hybridization}, \texttt{is\_aromatic} and \texttt{is\_in\_ring}. Each directed edge is one row of \texttt{edge\_attr} with three columns: \texttt{bond\_type}, \texttt{stereo} and \texttt{is\_conjugated}. Every entry is a position in the matching list in PyTorch Geometric's \texttt{x\_map} or \texttt{e\_map}, so a 6 in the \texttt{atomic\_num} column means the seventh entry of that list, not the quantity six. The nine atom columns have 119, 9, 11, 12, 9, 5, 8, 2 and 2 categories respectively, and the three bond columns 22, 6 and 2. A bond appears as two rows, one per direction.
+
+\textbf{Encoding used: trainable embeddings.} Each column gets its own \texttt{nn.Embedding} table sized to that column's number of categories; the nine atom embeddings are summed into one vector per atom and the three bond embeddings into one vector per edge. No arithmetic is done on the raw codes, so no ordering is implied between categories that have none, such as the hybridization states.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.60\linewidth]{25011138_ENG2440_A3_30_0.png}
+\caption{Paracetamol (\texttt{CC(=O)Nc1ccc(O)cc1}) as a chemical structure and as a node--edge graph, same numbering and same coordinates. Every atom is one node: node 0 is the methyl carbon, node 3 the amide nitrogen, node 8 the hydroxyl oxygen, and nodes 4--7, 9, 10 the aromatic ring. Hydrogens have no nodes because RDKit keeps them implicit and stores the count in \texttt{num\_hs}. Bond type is not visible in the graph view; it sits in \texttt{edge\_attr}.}
+\label{fig:graphview}
+\end{figure}
+
+\textbf{Batching.} A batch of 32 molecules is not padded. PyTorch Geometric concatenates the graphs into one large disconnected graph and renumbers the nodes, so one batch gives \texttt{x} $=[770, 9]$ (770 atoms in total), \texttt{edge\_index} $=[2, 1646]$ (823 bonds stored in both directions), \texttt{edge\_attr} $=[1646, 3]$, \texttt{batch} $=[770]$ mapping each atom to its molecule, and \texttt{y} $=[32, 1]$, the only tensor whose first dimension counts graphs. No edge joins two different molecules, so message passing cannot leak between them. Checks confirm all 1965 labels are finite, every graph has at least one atom, batch labels match graph counts in all 62 batches, and all 1965 molecules are recovered from the loader.
+
+\section{Splitting Strategies}
+Two 70:15:15 train--validation--test evaluations were built on the same 1965 molecules with seed 42: a stratified random split and a Bemis--Murcko scaffold split~\cite{bemis1996}. The 1965 molecules carry 1020 distinct scaffolds. No molecule is invalid, since the 11 unparsable SMILES were dropped before Part A. 95 molecules are acyclic; Bemis--Murcko gives them an empty scaffold, so all 95 form one group and land together in training, as the rule that molecules sharing a scaffold stay in one subset requires. The scaffold split cannot be stratified, which is why its validation and test subsets are 294 and 296 rather than 295 each. Both splits pass complete coverage, pairwise-disjoint indices and no canonical-SMILES overlap; the scaffold split additionally has disjoint scaffold sets, and the per-subset scaffold counts sum to exactly 1020.
+
+\begin{table}[H]
+\centering
+\caption{Molecule counts, positive-class proportions and unique scaffolds per subset. Whole cleaned set: 1965 molecules, 0.7634 positive.}
+\label{tab:splits}
+\small
+\begin{tabular}{llrrrr}
+\toprule
+Split & Subset & Molecules & Positive & Positive prop. & Unique scaffolds\\
+\midrule
+Random & train & 1375 & 1050 & 0.7636 & ---\\
+ & validation & 295 & 225 & 0.7627 & ---\\
+ & test & 295 & 225 & 0.7627 & ---\\
+\midrule
+Scaffold & train & 1375 & 1053 & 0.7658 & 430\\
+ & validation & 294 & 230 & 0.7823 & 294\\
+ & test & 296 & 217 & 0.7331 & 296\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Neither test set is read until the final evaluation. All hyperparameters, thresholds and early-stopping points are chosen on the validation subset of the matching split, and each test set is scored once with everything frozen.
+
+A random split assigns molecules independently of structure, and BBBP is not a collection of independent molecules: 1965 molecules carry only 1020 scaffolds, so most of the data arrives in families of close analogues that share a core and differ in a substituent. Random assignment cuts through those families, leaving one member in training while another lands in test, so a model can score well by recognising a core it has memorised rather than by generalising. That makes the estimate optimistic for the use that matters, predicting for a new chemical series. The scaffold split removes the shortcut by construction, and Table~\ref{tab:splits} shows the cost: train holds 430 scaffolds across 1375 molecules while validation and test hold one scaffold per molecule, and the positive rate drifts from 0.7823 to 0.7331.
+
+\section{Fingerprint Baseline}
+Morgan fingerprints~\cite{rdkit} are generated with radius 2 and length 2048, the ECFP4 setting, giving a $1965 \times 2048$ binary matrix. The fingerprint records which local substructures a molecule contains: RDKit walks outward from each atom, collects the circular neighbourhood reachable in up to 2 bonds, and hashes each distinct neighbourhood to one of the 2048 positions. It is a presence-or-absence list of fragments, so it does not record how many times a fragment occurs, how fragments are arranged, or the molecule's global shape.
+
+One logistic-regression classifier is fitted per split on that split's 1375 training molecules; validation and test fingerprints are never passed to \texttt{fit}. Because the training data is roughly 76\% positive, class weighting is a candidate: \texttt{class\_weight="balanced"} weights each class by $n_{\text{train}} / (2 n_{\text{class}})$ using the training counts only (325/1050 negative/positive for the random split, 322/1053 for the scaffold split).
+
+Eight combinations are then fitted per split, crossing $C \in \{0.01, 0.1, 1, 10\}$ with \texttt{class\_weight} $\in \{$None, balanced$\}$, each scored by ROC-AUC on validation, which is threshold-free. $C = 0.1$ with no class weighting wins on both splits, at validation ROC-AUC 0.9092 (random) and 0.8613 (scaffold). The decision threshold is then chosen from the winning model's validation probabilities by maximising balanced accuracy, giving 0.6802 and 0.7841. Balanced accuracy weights sensitivity and specificity equally, which matters because both are reported. Hyperparameters and thresholds were frozen before either test set was touched. Full reproduction settings are in Appendix~\ref{app:repro}.
+
+\section{Graph Neural Network}
+\textbf{Architecture.} An atom encoder, then three GINEConv message-passing layers, then mean pooling over each molecule's atoms, then a linear head to one logit. Each GINEConv wraps a two-layer MLP of 64--128--64 units and is followed by batch normalisation, ReLU and dropout at 0.2. The model has \textbf{67{,}268 trainable parameters}.
+
+\textbf{Encodings.} The nine categorical atom columns each get their own embedding table and the nine 64-dimensional vectors are summed into one vector per atom. The three bond columns are embedded the same way into one 64-dimensional vector per directed edge, with separate tables per layer. GINEConv adds the edge embedding to the neighbour's node vector before the MLP is applied, so every message depends on the bond it arrived along; zeroing all bond features changes the output, confirming they are used.
+
+\textbf{Training.} Binary cross-entropy on the logits, Adam at $10^{-3}$, batch size 32, at most 100 epochs. The loss is not reweighted: imbalance is handled by the validation-selected threshold, the same rule the baseline uses, so both models are treated identically. After every epoch the model is scored on validation by ROC-AUC, the best epoch's weights are kept and restored, and training stops after 20 epochs without improvement. Selection uses validation only. Training runs on the CPU rather than the Apple GPU, because the scatter aggregation used by message passing is non-deterministic on \texttt{mps} and the same seed gives different results between runs.
+
+\textbf{Learning curves} (Figure~\ref{fig:curves}). On the random split, training and validation loss fall together and end at 0.237 and 0.297, so there is no overfitting in the 34 epochs run; validation ROC-AUC rises to about 0.90 by epoch 10 and then oscillates between roughly 0.86 and 0.91 without trending up, so the model is not underfitting either. It is unstable epoch to epoch, with validation loss spiking to 0.80 at epoch 11. The scaffold split overfits: training loss falls steadily from 0.53 to 0.13 while validation loss stops improving after epoch 34 at 0.362 and then climbs to 0.513, the gap widening throughout. Validation ROC-AUC still drifts up to 0.876 at epoch 52 because it depends only on ranking and is insensitive to the overconfidence the loss is penalising.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.60\linewidth]{25011138_ENG2440_A3_70_0.png}\\[2pt]
+\includegraphics[width=0.60\linewidth]{25011138_ENG2440_A3_70_1.png}
+\caption{Training and validation loss and validation ROC-AUC, random split (top) and scaffold split (bottom), seed 42. Dashed line marks the selected epoch.}
+\label{fig:curves}
+\end{figure}
+
+\textbf{Three seeds} (Table~\ref{tab:seeds}). Validation ROC-AUC averages $0.9037 \pm 0.0060$ on the random split and $0.8786 \pm 0.0085$ on the scaffold split. Seed variation is small, a spread of 0.012 and 0.017 respectively, while the gap between the two strategies is 0.025, roughly three times that noise, and the two sets of runs do not overlap: the worst random-split seed (0.8977) still scores above the best scaffold-split seed (0.8880). The drop from random to scaffold splitting is therefore larger than what reseeding produces, though with three seeds this is evidence rather than proof. The epoch at which validation peaks is far less stable than the score, ranging from 14 to 39 and from 16 to 52.
+
+\begin{table}[H]
+\centering
+\caption{GNN validation ROC-AUC over three seeds per split strategy.}
+\label{tab:seeds}
+\small
+\begin{tabular}{lrrr@{\hskip 2em}lrr}
+\toprule
+Split & Seed & Val ROC-AUC & Best epoch & Split & Mean & SD\\
+\midrule
+Random & 42 & 0.9097 & 14 & Random & 0.9037 & 0.0060\\
+ & 43 & 0.8977 & 18 & Scaffold & 0.8786 & 0.0085\\
+ & 44 & 0.9036 & 39 & & &\\
+\midrule
+Scaffold & 42 & 0.8764 & 52 & & &\\
+ & 43 & 0.8715 & 16 & & &\\
+ & 44 & 0.8880 & 36 & & &\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Results}
+Each test set was scored once, applying only thresholds selected on the corresponding validation subset. For the GNN each seed received its own threshold from its own validation probabilities, using the same balanced-accuracy rule as the baseline.
+
+\begin{table}[H]
+\centering
+\caption{Test-set comparison. Fingerprint rows are single runs; GNN rows are mean $\pm$ SD over seeds 42, 43 and 44.}
+\label{tab:comparison}
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llccccccc}
+\toprule
+Model & Split & Threshold & ROC-AUC & PR-AUC & Accuracy & Sensitivity & Specificity & F1\\
+\midrule
+Fingerprint & Random & 0.6802 & 0.8888 & 0.9513 & 0.8576 & 0.9111 & 0.6857 & 0.9071\\
+GNN & Random & $0.5293 \pm 0.0580$ & $0.8884 \pm 0.0172$ & $0.9532 \pm 0.0115$ & $0.8644 \pm 0.0090$ & $0.9319 \pm 0.0156$ & $0.6476 \pm 0.0165$ & $0.9129 \pm 0.0066$\\
+Fingerprint & Scaffold & 0.7841 & 0.8915 & 0.9573 & 0.8142 & 0.8341 & 0.7595 & 0.8681\\
+GNN & Scaffold & $0.9148 \pm 0.0282$ & $0.8877 \pm 0.0212$ & $0.9509 \pm 0.0110$ & $0.8086 \pm 0.0333$ & $0.8065 \pm 0.0454$ & $0.8143 \pm 0.0193$ & $0.8602 \pm 0.0279$\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.58\linewidth]{25011138_ENG2440_A3_80_0.png}\\[2pt]
+\includegraphics[width=0.58\linewidth]{25011138_ENG2440_A3_80_1.png}
+\caption{ROC and precision--recall curves on the test sets, random split (top) and scaffold split (bottom). The dotted line in each PR panel is the positive rate of that subset.}
+\label{fig:roc}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.72\linewidth]{25011138_ENG2440_A3_81_0.png}
+\caption{Confusion matrices for all eight final test evaluations, each at its own validation-selected threshold.}
+\label{fig:confusion}
+\end{figure}
+
+\section{Discussion}
+\textbf{Baseline against GNN.} The two are indistinguishable on ranking. Test ROC-AUC is 0.8888 for the baseline against $0.8884 \pm 0.0172$ for the GNN on the random split, and 0.8915 against $0.8877 \pm 0.0212$ on the scaffold split; the baseline sits inside one standard deviation of the GNN both times. The evidence does not support the GNN being the better model here. Where the two differ is in where each validation-selected threshold landed, trading sensitivity against specificity, not in how well they order molecules.
+
+\textbf{Random against scaffold.} The two strategies separate on validation but not on test ROC-AUC: the GNN fell from 0.9037 to 0.8786 on validation, yet scores 0.8884 and 0.8877 on test. What changes on test are the threshold-dependent metrics, with accuracy dropping from 0.8644 to 0.8086 and F1 from 0.9129 to 0.8602 while specificity rises from 0.6476 to 0.8143. The scaffold split alters the balance of errors more than it reduces ranking quality. Both test subsets hold fewer than 300 molecules, so differences of a few thousandths should not be read as real.
+
+\textbf{What this does not establish.} Neither model is shown to be biologically useful. The labels are curated literature annotations, the cleaned dataset is 1965 molecules, and nothing has been checked against an external experiment. A PR-AUC near 0.95 looks strong only until one notes that 76\% of the data is positive, so precision starts from that floor. The weakest number is specificity, averaging 0.65 on the random split and 0.81 on the scaffold split; a false positive means calling a non-penetrating compound penetrant, the error a real screening use would care about most.
+
+\section{Error and Similarity Analysis}
+On the scaffold-split test set the GNN (seed 42, threshold 0.9038) makes 13 false positives and 39 false negatives. Figure~\ref{fig:errors} shows the two most confident of each.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.42\linewidth]{25011138_ENG2440_A3_89_0.png}
+\caption{The two most confident false positives and two most confident false negatives, with label and predicted probability.}
+\label{fig:errors}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Each selected error and its most similar training molecule by Morgan-fingerprint Tanimoto similarity.}
+\label{tab:similarity}
+\small
+\begin{tabular}{lccccc}
+\toprule
+Error & Test label & Test $p$ & Neighbour label & Neighbour $p$ & Tanimoto\\
+\midrule
+FP & 0 & 0.9990 & 1 & 0.8370 & 0.231\\
+FP & 0 & 0.9985 & 1 & 0.9957 & 0.273\\
+FN & 1 & 0.0015 & 1 & 0.9988 & 0.133\\
+FN & 1 & 0.0154 & 1 & 0.9758 & 0.172\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every one of the four errors is far from anything in training: Tanimoto similarity to the nearest training molecule is 0.231 and 0.273 for the false positives and 0.133 and 0.172 for the false negatives, against 1.0 for an identical fingerprint. The closest match to phenolphthalein is paracetamol, sharing only a phenol group. This is the scaffold split working as intended, since no test molecule shares a scaffold with training.
+
+Similarity does not explain these errors or the confidence behind them. All four nearest neighbours carry label 1 and the model predicts all four positive, from 0.837 to 0.996. If predictions were being inherited from the nearest training molecule, both false negatives would have come out positive, yet they score 0.0015 and 0.0154. The confident wrong answers cannot be traced to a nearby training example, and with no close analogue available, a high-confidence error is better read as a warning that the probabilities are not calibrated for chemistry outside the training distribution.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.46\linewidth]{25011138_ENG2440_A3_92_0.png}
+\includegraphics[width=0.46\linewidth]{25011138_ENG2440_A3_92_2.png}
+\caption{One false positive (left) and one false negative (right) beside its most similar training molecule. Remaining two pairs in Appendix~\ref{app:pairs}.}
+\label{fig:pairs}
+\end{figure}
+
+\section{Limitations}
+\begin{enumerate}
+\item \textbf{Label uncertainty.} The labels are literature annotations collected by Martins et al.~\cite{martins2012} from studies using different assays, not measurements made under one protocol. The dataset disagrees with itself: 10 canonical structures appear twice with opposite labels, aspirin among them, and those 20 records were removed. Molecules that disagree are visible; ones that are simply wrong are not.
+\item \textbf{Dataset size.} 1965 molecules survive cleaning and each test subset holds fewer than 300. The scaffold test set contains 79 negatives, so one molecule moves specificity by more than a percentage point. Differences of a few thousandths in ROC-AUC cannot be resolved at this size, which is why the baseline and the GNN could not be separated.
+\item \textbf{No external experimental validation.} Nothing here has been checked against a new measurement. Every number comes from held-out parts of one curated benchmark, so the results describe performance on this dataset, not on compounds a laboratory would supply next.
+\end{enumerate}
+
+The model is a correlation between substructure patterns and a recorded label. It was fitted, not intervened upon: nothing was altered in a molecule to observe the effect on penetration, so no causal claim follows. Penetration also depends on active transport and efflux, which a 2D graph does not encode, so the model cannot be said to capture the mechanism. It is not clinically suitable either: specificity averages 0.65 on the random split and 0.81 on the scaffold split, the most confident errors are wrong at $p = 0.999$, and the similarity analysis shows the probabilities are not calibrated for chemistry unlike the training set. At most this ranks compounds for a later experiment.
+
+\section{Conclusion}
+The graph network did not beat the fingerprint baseline on either split, and across three seeds the gap stays well inside seed variation. What scaffold splitting changed was where the errors fall rather than how well molecules are ranked: GNN specificity rose from 0.6476 to 0.8143 while sensitivity fell from 0.9319 to 0.8065, driven by thresholds that validation placed much higher. The similarity analysis points the same way. All four of the most confident mistakes sit between 0.13 and 0.27 Tanimoto from anything in training, and their nearest training molecules are labelled 1 and predicted positive, so the model is not inheriting a neighbour's answer but failing on chemistry it has not seen.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+\bibitem{wu2018} Z.~Wu et al. MoleculeNet: A benchmark for molecular machine learning. \emph{Chemical Science}, 9(2):513--530, 2018.
+\bibitem{martins2012} I.~F. Martins et al. A Bayesian approach to in silico blood-brain barrier penetration modeling. \emph{J. Chem. Inf. Model.}, 52(6):1686--1697, 2012.
+\bibitem{fey2019} M.~Fey and J.~E. Lenssen. Fast graph representation learning with PyTorch Geometric. \emph{ICLR Workshop on Representation Learning on Graphs and Manifolds}, 2019.
+\bibitem{bemis1996} G.~W. Bemis and M.~A. Murcko. The properties of known drugs. 1. Molecular frameworks. \emph{J. Med. Chem.}, 39(15):2887--2893, 1996.
+\bibitem{rdkit} G.~Landrum et al. RDKit: Open-source cheminformatics software. \url{https://www.rdkit.org/}, 2016.
+\end{thebibliography}
+
+\appendix
+\section{Baseline Reproduction Settings}
+\label{app:repro}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+Setting & Random split & Scaffold split\\
+\midrule
+Seed & 42 & 42\\
+Molecules after cleaning & 1965 & 1965\\
+Split fractions & (0.70, 0.15, 0.15) & (0.70, 0.15, 0.15)\\
+Train/validation/test & 1375/295/295 & 1375/294/296\\
+Fingerprint & Morgan radius 2, 2048 bits & Morgan radius 2, 2048 bits\\
+Grid searched & \multicolumn{2}{l}{$C \in \{0.01, 0.1, 1, 10\} \times$ \texttt{class\_weight} $\in \{$None, balanced$\}$}\\
+Selection metric & validation ROC-AUC & validation ROC-AUC\\
+Selected $C$ & 0.1 & 0.1\\
+Selected \texttt{class\_weight} & None & None\\
+Solver / max\_iter & liblinear / 5000 & liblinear / 5000\\
+Threshold rule & \multicolumn{2}{l}{maximum balanced accuracy on validation}\\
+Threshold & 0.6802 & 0.7841\\
+\bottomrule
+\end{tabular}
+\caption{Everything needed to reproduce the fingerprint baseline for both split strategies. The GNN uses the same seed and splits, with hidden width 64, 3 layers, dropout 0.2, Adam at $10^{-3}$, batch size 32, at most 100 epochs and patience 20; seeds 42, 43 and 44 are reported.}
+\end{table}
+
+\section{Remaining Similarity Pairs}
+\label{app:pairs}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.49\linewidth]{25011138_ENG2440_A3_92_1.png}
+\includegraphics[width=0.49\linewidth]{25011138_ENG2440_A3_92_3.png}
+\caption{The second false positive (left) and second false negative (right) beside their most similar training molecules.}
+\end{figure}
+
+\end{document}

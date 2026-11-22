@@ -1,0 +1,30 @@
+AI Use Declaration
+==================
+
+Student: Md Aman Khan
+Student ID: 25011138
+Module: ENG 2440 Medical Imaging & AI in Healthcare
+Assignment: Assignment 3 - Molecular Property Prediction with Graph Neural Networks
+
+[TO BE COMPLETED BEFORE SUBMISSION]
+
+1. Tools used
+-------------
+
+Tool:
+
+Purpose of use:
+
+-
+
+Representative prompt types:
+
+-
+
+Affected submission parts:
+
+-
+
+2. Independent work, verification and limits
+--------------------------------------------
+
